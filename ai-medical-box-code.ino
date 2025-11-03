@@ -5,6 +5,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <ThreeWire.h>
+#include <RtcDS1302.h>
 
 // ==============================
 // CONFIGURATION
@@ -18,16 +20,16 @@ const int buzzerPin = 2;
 const int ledPin = 5;
 
 const long STEPS_PER_REV = 4096;
-const long STEPS_45_DEG = STEPS_PER_REV / 8;
+const long STEPS_PER_SLOT = STEPS_PER_REV / 12;
 const int stepDelayMs = 2;
 
 // WiFi credentials
-const char* ssid = "sudo -rm -rf /*";
+const char* ssid = "sudo rm -rf /*";
 const char* password = "FJTe5aWqz9hvvg2y";
 
 // Firebase REST
-#define FIREBASE_PROJECT_ID "test-6c45a"
-#define FIREBASE_API_KEY "AIzaSyDZMtTK6_lma8855D81yGhkeMvzc27Aut4"   
+#define FIREBASE_PROJECT_ID "e-c-s-project-d7pu2p"
+#define FIREBASE_API_KEY "AIzaSyDpOte-YKJeM366Xqrm500z8KO8LQ0vtyI"
 #define FIREBASE_COLLECTION "dispenser"
 String FIRESTORE_URL = "https://firestore.googleapis.com/v1/projects/" FIREBASE_PROJECT_ID "/databases/(default)/documents/" FIREBASE_COLLECTION "/";
 
@@ -42,20 +44,26 @@ const int daylightOffset_sec = 0;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 WebServer server(80);
 
+ThreeWire myWire(13, 15, 12); // DAT, CLK, RST
+RtcDS1302<ThreeWire> rtc(myWire);
+bool rtcReady = false;
+bool ntpReady = false;
+
 struct Schedule {
-  int morningHour = 8;
-  int morningMinute = 0;
-  int eveningHour = 18;
-  int eveningMinute = 0;
-  int nightHour = 22;
-  int nightMinute = 0;
+  int morningHour;
+  int morningMinute;
+  int eveningHour;
+  int eveningMinute;
+  int nightHour;
+  int nightMinute;
 } schedule;
 
 bool dispenseDoneMorning = false;
 bool dispenseDoneEvening = false;
 bool dispenseDoneNight = false;
-bool ntpReady = false;
 
+int dayCounter = 1;
+int slotCounter = 0;
 String lastDispenseTime = "None";
 String lastPickupTime = "None";
 
@@ -89,16 +97,55 @@ void stepSteps(long steps, int direction) {
 }
 
 // ==============================
-// TIME UTILS
+// TIME UTILS (RTC + NTP)
 // ==============================
-String getTimeString() {
+bool syncNTP() {
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 5000)) {
+    Serial.println("[TIME] NTP sync failed.");
+    ntpReady = false;
+    return false;
+  }
+
+  RtcDateTime now(
+    timeinfo.tm_year + 1900,
+    timeinfo.tm_mon + 1,
+    timeinfo.tm_mday,
+    timeinfo.tm_hour,
+    timeinfo.tm_min,
+    timeinfo.tm_sec
+  );
+  rtc.SetDateTime(now);
+  rtcReady = true;
+  ntpReady = true;
+
+  Serial.println("[TIME] NTP synced & RTC updated.");
+  return true;
+}
+
+void getCurrentTime(int &hour, int &minute, int &second) {
   struct tm timeinfo;
   if (getLocalTime(&timeinfo)) {
-    char buffer[20];
-    strftime(buffer, sizeof(buffer), "%H:%M:%S", &timeinfo);
-    return String(buffer);
+    hour = timeinfo.tm_hour;
+    minute = timeinfo.tm_min;
+    second = timeinfo.tm_sec;
+  } else if (rtcReady) {
+    RtcDateTime now = rtc.GetDateTime();
+    hour = now.Hour();
+    minute = now.Minute();
+    second = now.Second();
+  } else {
+    hour = minute = second = 0;
   }
-  return "00:00:00";
+}
+
+String getTimeString() {
+  int h, m, s;
+  getCurrentTime(h, m, s);
+  char buffer[9];
+  sprintf(buffer, "%02d:%02d:%02d", h, m, s);
+  return String(buffer);
 }
 
 // ==============================
@@ -119,6 +166,8 @@ void uploadToFirestore() {
   fields["timestamp"]["stringValue"] = getTimeString();
   fields["lastDispense"]["stringValue"] = lastDispenseTime;
   fields["lastPickup"]["stringValue"] = lastPickupTime;
+  fields["dayCounter"]["integerValue"] = dayCounter;
+  fields["slotCounter"]["integerValue"] = slotCounter;
 
   String jsonBody;
   serializeJson(doc, jsonBody);
@@ -128,37 +177,98 @@ void uploadToFirestore() {
   http.end();
 }
 
+// ==============================
+// FIRESTORE FETCH (NEW)
+// ==============================
 void fetchScheduleFromFirestore() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Firestore] WiFi not connected, skipping fetch.");
+    return;
+  }
+
+  String userID = "OIKe2i8z6eSlloQe7ciwh1EqAto2";
 
   HTTPClient http;
-  String url = FIRESTORE_URL + "schedule?key=" + FIREBASE_API_KEY;
+  String url = "https://firestore.googleapis.com/v1/projects/" FIREBASE_PROJECT_ID
+               "/databases/(default)/documents:runQuery?key=" FIREBASE_API_KEY;
+
   http.begin(url);
-  int httpCode = http.GET();
+  http.addHeader("Content-Type", "application/json");
+
+  // Firestore structuredQuery JSON
+  String query = "{\
+    \"structuredQuery\": {\
+      \"from\": [{\"collectionId\": \"medications\"}],\
+      \"where\": {\
+        \"fieldFilter\": {\
+          \"field\": {\"fieldPath\": \"userID\"},\
+          \"op\": \"EQUAL\",\
+          \"value\": {\"stringValue\": \"" + userID + "\"}\
+        }\
+      }\
+    }\
+  }";
+
+  Serial.println("[Firestore] Fetching schedule for user: " + userID);
+  int httpCode = http.POST(query);
 
   if (httpCode == 200) {
     String payload = http.getString();
-    DynamicJsonDocument doc(1024);
-    deserializeJson(doc, payload);
+    Serial.println("[Firestore] Response received.");
 
-    JsonObject fields = doc["fields"];
-    schedule.morningHour = fields["morningHour"]["integerValue"].as<int>();
-    schedule.morningMinute = fields["morningMinute"]["integerValue"].as<int>();
-    schedule.eveningHour = fields["eveningHour"]["integerValue"].as<int>();
-    schedule.eveningMinute = fields["eveningMinute"]["integerValue"].as<int>();
-    schedule.nightHour = fields["nightHour"]["integerValue"].as<int>();
-    schedule.nightMinute = fields["nightMinute"]["integerValue"].as<int>();
+    DynamicJsonDocument doc(16384);
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+      Serial.print("[Firestore] JSON parse failed: ");
+      Serial.println(error.f_str());
+      http.end();
+      return;
+    }
 
-    Serial.println("[Firestore] Schedule updated successfully");
+    bool found = false;
+    for (JsonObject result : doc.as<JsonArray>()) {
+      if (!result.containsKey("document")) continue;
+      JsonObject fields = result["document"]["fields"];
+
+      String session = fields["session"]["stringValue"].as<String>();
+      int hour = fields["hour"]["integerValue"].as<int>();
+      int minute = fields["minute"]["integerValue"].as<int>();
+
+      if (session == "Morning") {
+        schedule.morningHour = hour;
+        schedule.morningMinute = minute;
+      } else if (session == "Evening") {
+        schedule.eveningHour = hour;
+        schedule.eveningMinute = minute;
+      } else if (session == "Night") {
+        schedule.nightHour = hour;
+        schedule.nightMinute = minute;
+      }
+
+      found = true;
+      Serial.printf("[Firestore] %s -> %02d:%02d\n", session.c_str(), hour, minute);
+    }
+
+    if (found) {
+      lcd.clear();
+      lcd.print("Schedule Updated!");
+      delay(2000);
+    } else {
+      lcd.clear();
+      lcd.print("No schedule found");
+      delay(2000);
+    }
+    lcd.clear();
+
   } else {
-    Serial.printf("[Firestore] Failed to fetch schedule: %d\n", httpCode);
+    Serial.printf("[Firestore] Fetch failed, code: %d\n", httpCode);
   }
 
   http.end();
 }
 
 // ==============================
-// DISPENSE LOGIC + IR CHECK
+// DISPENSE LOGIC
 // ==============================
 void waitForTabletPickup() {
   lcd.clear();
@@ -170,12 +280,7 @@ void waitForTabletPickup() {
 
   while (millis() - start < 120000) {
     int irValue = digitalRead(irSensorPin);
-    lcd.setCursor(0, 1);
-    lcd.print("IR:");
-    lcd.print(irValue);
-    lcd.print("   ");
     delay(200);
-
     if (irValue == 1) {
       digitalWrite(buzzerPin, HIGH);
       taken = true;
@@ -183,7 +288,7 @@ void waitForTabletPickup() {
       Serial.println("Tablet taken at: " + lastPickupTime);
       lcd.clear();
       lcd.print("Taken @ ");
-      lcd.print(lastPickupTime);
+      lcd.print(lastPickupTime.substring(0, 5));
       delay(2000);
       break;
     }
@@ -196,18 +301,21 @@ void waitForTabletPickup() {
     Serial.println("Tablet not taken in 2 min");
     delay(2000);
   }
+
+  lcd.clear();
 }
 
-void dispense(int rotations) {
+void dispense(int slots) {
   lcd.clear();
   lcd.print("Dispensing...");
   Serial.println("Dispensing...");
 
   digitalWrite(buzzerPin, LOW);
 
-  for (int i = 0; i < rotations; i++) {
-    stepSteps(STEPS_45_DEG, 1);
-    delay(300);
+  for (int i = 0; i < slots; i++) {
+    stepSteps(STEPS_PER_SLOT, 1);
+    delay(1000);
+    slotCounter++;
   }
 
   lastDispenseTime = getTimeString();
@@ -215,36 +323,14 @@ void dispense(int rotations) {
   lcd.clear();
   lcd.print("Done!");
   delay(1000);
+  lcd.clear();
 
   waitForTabletPickup();
   uploadToFirestore();
 }
 
 // ==============================
-// NTP SYNC
-// ==============================
-bool syncNTP() {
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo, 5000)) {
-    Serial.println("NTP sync failed");
-    return false;
-  }
-  Serial.println("NTP time synced");
-  return true;
-}
-
-void getCurrentTime(int &hour, int &minute, int &second) {
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    hour = timeinfo.tm_hour;
-    minute = timeinfo.tm_min;
-    second = timeinfo.tm_sec;
-  } else hour = minute = second = 0;
-}
-
-// ==============================
-// WEB SERVER HANDLERS (JSON)
+// WEB SERVER
 // ==============================
 void sendJSON(int code, String json) {
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -255,9 +341,8 @@ void handleRoot() { sendJSON(200, "{\"status\":\"ESP32 Online\"}"); }
 
 void handleStatus() {
   String json = String("{") +
-    "\"morning\":\"" + String(schedule.morningHour) + ":" + String(schedule.morningMinute) + "\"," +
-    "\"evening\":\"" + String(schedule.eveningHour) + ":" + String(schedule.eveningMinute) + "\"," +
-    "\"night\":\"" + String(schedule.nightHour) + ":" + String(schedule.nightMinute) + "\"," +
+    "\"dayCounter\":\"" + String(dayCounter) + "\"," +
+    "\"slotCounter\":\"" + String(slotCounter) + "\"," +
     "\"lastDispense\":\"" + lastDispenseTime + "\"," +
     "\"lastPickup\":\"" + lastPickupTime + "\"" +
   "}";
@@ -284,7 +369,11 @@ void setup() {
   digitalWrite(buzzerPin, HIGH);
   digitalWrite(ledPin, HIGH);
 
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+
   lcd.setCursor(0, 1);
   lcd.print("WiFi...");
   Serial.print("Connecting to WiFi");
@@ -296,17 +385,25 @@ void setup() {
     retry++;
   }
 
+  rtc.Begin();
+
   if (WiFi.status() == WL_CONNECTED) {
     lcd.clear();
     lcd.print("WiFi OK");
     Serial.println("\nConnected to WiFi");
     Serial.println(WiFi.localIP());
     delay(2000);
+    fetchScheduleFromFirestore(); // 🔥 NEW
     ntpReady = syncNTP();
-    fetchScheduleFromFirestore();  // initial pull
   } else {
     lcd.print("WiFi Fail");
     Serial.println("\nWiFi failed.");
+    if (rtc.IsDateTimeValid()) {
+      rtcReady = true;
+      Serial.println("[RTC] Fallback active.");
+    } else {
+      Serial.println("[RTC] No valid time source.");
+    }
   }
 
   server.on("/", HTTP_GET, handleRoot);
@@ -316,42 +413,76 @@ void setup() {
 }
 
 // ==============================
-// MAIN LOOP
+// LOOP
 // ==============================
 unsigned long lastFirestoreUpload = 0;
 unsigned long lastScheduleFetch = 0;
+const unsigned long SCHEDULE_FETCH_INTERVAL = 600000; // 10 minutes (in ms)
+
 
 void loop() {
   server.handleClient();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Disconnected, retrying...");
+    WiFi.reconnect();
+    delay(5000);
+  }
 
   int hour, minute, second;
   getCurrentTime(hour, minute, second);
 
   lcd.setCursor(0, 0);
-  char buf[9];
-  sprintf(buf, "%02d:%02d:%02d", hour, minute, second);
+  char buf[17];
+  sprintf(buf, "Time:%02d:%02d:%02d", hour, minute, second);
   lcd.print(buf);
+
   lcd.setCursor(0, 1);
-  lcd.print("IR:");
+  lcd.print("Slot:");
+  lcd.print(slotCounter);
+  lcd.print(" IR:");
   lcd.print(digitalRead(irSensorPin));
 
+  if (dayCounter > 4 || slotCounter >= 12) {
+    lcd.clear();
+    lcd.print("REFILL NEEDED!");
+    Serial.println("All 12 slots used - refill required!");
+    delay(3000);
+    return;
+  }
+
   if (hour == schedule.morningHour && minute == schedule.morningMinute && !dispenseDoneMorning) {
-    dispense(3);
+    dispense(1);
     dispenseDoneMorning = true;
   }
   if (hour == schedule.eveningHour && minute == schedule.eveningMinute && !dispenseDoneEvening) {
-    dispense(3);
+    dispense(1);
     dispenseDoneEvening = true;
   }
   if (hour == schedule.nightHour && minute == schedule.nightMinute && !dispenseDoneNight) {
-    dispense(2);
+    dispense(1);
     dispenseDoneNight = true;
   }
-  if (hour == 0 && minute == 1) dispenseDoneMorning = dispenseDoneEvening = dispenseDoneNight = false;
+
+  if (hour == 0 && minute == 1 && second < 5) {
+    dispenseDoneMorning = dispenseDoneEvening = dispenseDoneNight = false;
+    dayCounter++;
+    Serial.printf("New day: %d\n", dayCounter);
+  }
 
   unsigned long now = millis();
-  if (now - lastFirestoreUpload > 60000) { uploadToFirestore(); lastFirestoreUpload = now; }
-  if (now - lastScheduleFetch > 300000) { fetchScheduleFromFirestore(); lastScheduleFetch = now; }
+  // Push data every 1 min
+  if (now - lastFirestoreUpload > 60000) {
+    uploadToFirestore();
+    lastFirestoreUpload = now;
+  }
+
+  // Fetch schedule every 10 min
+  if (now - lastScheduleFetch > SCHEDULE_FETCH_INTERVAL) {
+    Serial.println("[Scheduler] Refreshing schedule from Firestore...");
+    fetchScheduleFromFirestore();
+    lastScheduleFetch = now;
+  }
 
   delay(500);
 }
