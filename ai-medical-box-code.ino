@@ -29,9 +29,9 @@ const char* password = "FJTe5aWqz9hvvg2y";
 
 // Firebase REST
 #define FIREBASE_PROJECT_ID "e-c-s-project-d7pu2p"
-#define FIREBASE_API_KEY "AIzaSyDpOte-YKJeM366Xqrm500z8KO8LQ0vtyI"
+#define FIREBASE_API_KEY ""
 #define FIREBASE_COLLECTION "dispenser"
-String FIRESTORE_URL = "https://firestore.googleapis.com/v1/projects/" FIREBASE_PROJECT_ID "/databases/(default)/documents/" FIREBASE_COLLECTION "/";
+String FIRESTORE_URL = "" FIREBASE_PROJECT_ID "/databases/(default)/documents/" FIREBASE_COLLECTION "/";
 
 // NTP settings
 const char* ntpServer = "time.google.com";
